@@ -8,7 +8,7 @@ import scipy.optimize as op
 # =============================
 # Configuración interactiva
 # =============================
-st.title("Simulador de Estrategias de Inversión con Optimización Exacta y Monte Carlo")
+st.title("Simulador de Estrategias de Inversión con Optimización")
 
 # Parámetros configurables en la barra lateral
 st.sidebar.header("Configuración")
@@ -28,14 +28,14 @@ sectores = ['XLC','XLY','XLP','XLE','XLF','XLV','XLI','XLB','XLRE','XLK','XLU']
 
 @st.cache_data(show_spinner=False)
 def descargar_datos(tickers, start_date, end_date):
-    df = yf.download(tickers, start=start_date, end=end_date)['Adj Close']
+    df = yf.download(tickers, start=start_date, end=end_date)['Close']
     return df.pct_change().dropna()
 
 returns_regiones = descargar_datos(regiones, start_date, end_date)
 returns_sectores = descargar_datos(sectores, start_date, end_date)
 
 # =============================
-# Benchmarks sintéticos
+# Benchmarks
 # =============================
 pesos_regiones = np.array([0.7062, 0.0323, 0.1176, 0.0902, 0.0537])
 benchmark_regiones = returns_regiones[regiones] @ pesos_regiones
@@ -77,18 +77,56 @@ def calmar_ratio(r, periods=252):
     cagr = (cumulative[-1])**(periods / len(r)) - 1
     return cagr / max_dd if max_dd != 0 else np.nan
 
+def calcular_var(returns, confidence=0.95):
+    VaR = returns.quantile(1 - confidence)
+    return VaR
+
+def calcular_cvar(returns, confidence=0.95):
+    VaR = returns.quantile(1 - confidence)
+    CVaR = returns[returns <= VaR].mean()
+    return CVaR
+
+
+def calcular_drawdown(returns):
+    cumulative = (1 + returns).cumprod()
+    running_max = cumulative.cummax()
+    drawdown = (cumulative - running_max) / running_max
+    return drawdown.min()
+
+def calcular_beta(asset_returns, market_returns):
+    if isinstance(asset_returns, pd.DataFrame):
+        asset_returns = asset_returns.iloc[:, 0]
+    if isinstance(market_returns, pd.DataFrame):
+        market_returns = market_returns.iloc[:, 0]
+    common_index = asset_returns.index.intersection(market_returns.index)
+    if len(common_index) < 2:
+        return np.nan
+    cov = np.cov(asset_returns, market_returns)[0, 1]
+    var = np.var(market_returns)
+
+    if var == 0:
+        return np.nan
+
+    return cov / var
+
+    
 def calcular_metricas_completas(returns, weights, benchmark):
     port_ret = returns @ weights
     return {
+        "VaR 95%": calcular_var(port_ret),
+        "CVaR 95%": calcular_cvar(port_ret),
+        "Beta": calcular_beta(port_ret,benchmark),
+        "Drawdow":calcular_drawdown(port_ret),
         "Sharpe": sharpe_ratio(port_ret),
         "Sortino": sortino_ratio(port_ret),
         "Treynor": treynor_ratio(port_ret, benchmark),
         "Information Ratio": information_ratio(port_ret, benchmark),
-        "Calmar": calmar_ratio(port_ret)
+        "Calmar": calmar_ratio(port_ret) 
+
     }
 
 # =============================
-# Optimización exacta con scipy
+# Optimización
 # =============================
 def performance(weights, mean_returns, cov_matrix):
     ret = np.dot(weights, mean_returns)
@@ -177,22 +215,42 @@ st.subheader(f"Estrategia seleccionada: {menu}")
 # =============================
 st.write("### Definir ponderaciones del portafolio")
 user_weights = []
+
 for col in datos.columns:
     w = st.slider(f"Ponderación {col}", 0.0, 1.0, 0.1, 0.01)
     user_weights.append(w)
+
 user_weights = np.array(user_weights)
-if user_weights.sum() > 0:
-    user_weights = user_weights / user_weights.sum()
-else:
+suma = user_weights.sum()
+
+if suma == 0:
     user_weights = np.repeat(1/len(datos.columns), len(datos.columns))
-st.write("Pesos normalizados:", user_weights)
+else:
+    user_weights = user_weights / suma
+    st.success(f"Pesos: Suma total = {user_weights.sum():.4f}")
+
+st.write("#### Pesos finales")
+pesos_dict = {col: round(w, 4) for col, w in zip(datos.columns, user_weights)}
+st.dataframe(pesos_dict)
+
+# =============================
+
+# Distribución de rendimientos del portafolio del usuario
+# =============================
+st.write("### Distribución de rendimientos del portafolio arbitrario")
+port_ret = datos @ user_weights
+fig_hist = px.histogram(port_ret, nbins=40, title='Distribución de rendimientos diarios',
+                        labels={'value':'Rendimiento diario'}, color_discrete_sequence=['orange'])
+fig_hist.update_layout(showlegend=False)
+
+st.plotly_chart(fig_hist, use_container_width=True)
 
 # =============================
 # Métricas del portafolio arbitrario
 # =============================
 metricas = calcular_metricas_completas(datos, user_weights, benchmark)
 st.write("### Métricas del portafolio arbitrario")
-st.dataframe(pd.DataFrame(metricas, index=["Portafolio"]).round(4))
+st.dataframe(pd.DataFrame(metricas, index=["Portafolio"]).round(4).T, use_container_width=True)
 
 # =============================
 # Estadísticas y optimización exacta
@@ -200,15 +258,9 @@ st.dataframe(pd.DataFrame(metricas, index=["Portafolio"]).round(4))
 mean_returns = datos.mean() * periods_per_year
 cov_matrix = datos.cov() * periods_per_year
 
-st.write("### Estadísticas anualizadas por activo")
-stats_df = pd.DataFrame({
-    'Retorno anual': mean_returns,
-    'Volatilidad anual': np.sqrt(np.diag(cov_matrix)),
-    'Sharpe individual (rf)': (mean_returns - rf) / np.sqrt(np.diag(cov_matrix))
-}).round(4)
-st.dataframe(stats_df)
 
-st.write("### Optimización exacta (SLSQP)")
+
+st.write("### Optimización")
 results = optimize_portfolio(mean_returns.values, cov_matrix.values)
 
 # Mostrar tablas de pesos y resumen ejecutivo
@@ -232,22 +284,19 @@ for key, label in [('min_var', 'Mínima varianza'),
         tables.append((label, df_res))
         summaries.append(summary)
 
-for label, df_res in tables:
-    st.write(f"#### {label} — pesos significativos (>1%)")
-    st.dataframe(df_res[df_res['Peso'] > 0.01].sort_values('Peso', ascending=False).reset_index(drop=True).round(4))
 
-st.write("### Resumen ejecutivo de portafolios óptimos")
+st.write("### Resumen de portafolios óptimos")
 st.dataframe(pd.DataFrame(summaries))
 
 # =============================
 # Frontera eficiente exacta y CML
 # =============================
-st.write("### Frontera eficiente (exacta) y línea de mercado de capital (CML)")
+st.write("### Frontera eficiente y línea de mercado de capital (CML)")
 front_vols, front_rets = efficient_frontier(mean_returns.values, cov_matrix.values, n_points=40)
 
 fig_front = px.scatter(x=front_vols, y=front_rets,
                        labels={'x': 'Volatilidad anual', 'y': 'Retorno anual'},
-                       title='Frontera eficiente — Optimización exacta')
+                       title='Frontera eficiente')
 if 'min_var' in results:
     fig_front.add_scatter(x=[results['min_var']['vol']], y=[results['min_var']['return']],
                           mode='markers', name='Mínima varianza',
@@ -256,7 +305,7 @@ if 'max_sharpe' in results:
     fig_front.add_scatter(x=[results['max_sharpe']['vol']], y=[results['max_sharpe']['return']],
                           mode='markers', name='Máximo Sharpe',
                           marker=dict(size=12, color='green', symbol='star'))
-    x = np.linspace(0, max(front_vols.max(), results['max_sharpe']['vol'] * 1.2), 120)
+    x = np.linspace(0, max(front_vols.max(), results['max_sharpe']['vol'] * 1.2), 300)
     y_cml = rf + ((results['max_sharpe']['return'] - rf) / results['max_sharpe']['vol']) * x
     fig_front.add_scatter(x=x, y=y_cml, mode='lines', name='CML',
                           line=dict(color='green', dash='dash'))
@@ -266,10 +315,10 @@ if 'max_ret' in results:
                           marker=dict(size=10, color='purple'))
 st.plotly_chart(fig_front, use_container_width=True)
 
+
 # =============================
-# Optimización y visualizaciones (Markowitz — Monte Carlo)
+# visualizaciones
 # =============================
-st.write("### Optimización y visualizaciones (Markowitz — Monte Carlo)")
 exp_returns = mean_returns.values
 cov_values = cov_matrix.values
 num_assets = len(exp_returns)
@@ -287,45 +336,48 @@ df_mc = pd.DataFrame(mc_results, columns=['Retorno','Volatilidad','Sharpe','Peso
 best_sharpe = df_mc.loc[df_mc['Sharpe'].idxmax()]
 min_vol = df_mc.loc[df_mc['Volatilidad'].idxmin()]
 
-fig_mc = px.scatter(df_mc, x='Volatilidad', y='Retorno', color='Sharpe',
-                    title='Frontera aproximada — Monte Carlo',
-                    labels={'Volatilidad':'Riesgo (anual)','Retorno':'Retorno (anual)'})
-fig_mc.add_scatter(x=[best_sharpe['Volatilidad']], y=[best_sharpe['Retorno']],
-                   mode='markers', name='Máx. Sharpe (MC)', marker=dict(size=12, color='black', symbol='star'))
-fig_mc.add_scatter(x=[min_vol['Volatilidad']], y=[min_vol['Retorno']],
-                   mode='markers', name='Mín. Vol (MC)', marker=dict(size=10, color='orange'))
-st.plotly_chart(fig_mc, use_container_width=True)
-
 # =============================
-# Gráfico circular de pesos del Máximo Sharpe (exacto)
+#  Portafolio vs Benchmark
 # =============================
-if 'max_sharpe' in results:
-    st.write("### Distribución de pesos — Portafolio Máximo Sharpe (exacto)")
-    w_exact = results['max_sharpe']['weights']
-    mask = w_exact > 0.005
-    labels = np.array(universo)[mask]
-    values = w_exact[mask]
-    if len(values) > 0:
-        fig_pie = px.pie(names=labels, values=values, title="Pesos significativos (>0.5%)")
-        st.plotly_chart(fig_pie, use_container_width=True)
-    else:
-        st.info("No hay pesos significativos (>0.5%).")
-
-# =============================
-# Distribución de rendimientos del portafolio del usuario
-# =============================
-st.write("### Distribución de rendimientos del portafolio arbitrario")
-port_ret = datos @ user_weights
-fig_hist = px.histogram(port_ret, nbins=40, title='Distribución de rendimientos diarios',
-                        labels={'value':'Rendimiento diario'}, color_discrete_sequence=['orange'])
-st.plotly_chart(fig_hist, use_container_width=True)
-
-# =============================
-# Curva de capital del portafolio arbitrario vs benchmark
-# =============================
-st.write("### Curva de capital — Portafolio arbitrario vs benchmark")
+st.write("###  Portafolios vs Benchmark")
 capital_port = (1 + port_ret).cumprod()
+
 capital_bmk = (1 + benchmark.loc[port_ret.index]).cumprod()
-df_capital = pd.DataFrame({'Portafolio': capital_port, 'Benchmark': capital_bmk})
-fig_capital = px.line(df_capital, title='Evolución del capital (base = 1)')
-st.plotly_chart(fig_capital, use_container_width=True)
+tabs = st.tabs(["Portafolio Arbitrario", "Max Sharpe", "Minima Volatilidad"])
+
+with tabs[0]:
+    st.write("### Evolución del Portafolio Arbitrario vs Benchmark")
+
+    df_capital = pd.DataFrame({
+        'Portafolio': capital_port,
+        'Benchmark': capital_bmk
+    })
+
+    fig_capital = px.line(df_capital,
+                          title="Portafolio Arbitrario vs Benchmark",
+                          labels={'value': 'Capital acumulado'})
+    st.plotly_chart(fig_capital, use_container_width=True)
+
+with tabs[1]:
+    st.write("### Portafolio de Máximo Sharpe vs Benchmark")
+    capital_sharpe = (1 + datos.dot(best_sharpe["Pesos"])).cumprod()
+    df_sharpe = pd.DataFrame({
+        'Max Sharpe': capital_sharpe,
+        'Benchmark': capital_bmk
+    })
+    fig_sharpe = px.line(df_sharpe,
+                         title="Portafolio de Máximo Sharpe vs Benchmark",
+                         labels={'value': 'Capital acumulado'})
+    st.plotly_chart(fig_sharpe, use_container_width=True)
+
+with tabs[2]:
+    st.write("### Portafolio de Mínima Volatilidad vs Benchmark")
+    capital_minvol = (1 + datos.dot(min_vol["Pesos"])).cumprod()
+    df_minvol = pd.DataFrame({
+        'Mínima Volatilidad': capital_minvol,
+        'Benchmark': capital_bmk
+    })
+    fig_minvol = px.line(df_minvol,
+                         title="Portafolio de Mínima Volatilidad vs Benchmark",
+                         labels={'value': 'Capital acumulado'})
+    st.plotly_chart(fig_minvol, use_container_width=True)
