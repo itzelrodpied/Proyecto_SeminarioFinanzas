@@ -453,7 +453,7 @@ with tabs[2]:
     st.plotly_chart(fig_minvol, use_container_width=True)
 
 with tabs[4]:
-    st.write("### Portafolio Black Litterman (vistas absolutas)pvs Benchmark")
+    st.write("### Portafolio Black Litterman (vistas absolutas) vs Benchmark")
     w_bl = results_bl["max_sharpe"]["weights"]
     port_ret_bl = datos@w_bl
     capital_bl = (1 + port_ret_bl).cumprod()
@@ -483,3 +483,4 @@ with tabs[3]:
 
     st.plotly_chart(fig_max_ret, use_container_width=True)
     
+
